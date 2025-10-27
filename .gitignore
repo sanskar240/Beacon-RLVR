@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environment
+venv/
+
+
+# Large datasets (if not needed in Git)
+data/*
+!data/beacon-verifier.csv
+!data/sft_dataset.csv
+!data/beacon-verifier.json
+!data/sft_dataset.json
+
+# Logs and temp files
+*.log
+*.cache
+*.tmp
+
+# VSCode
+.vscode/
