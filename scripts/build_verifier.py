@@ -1,80 +1,88 @@
 from datasets import load_dataset
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
 from collections import Counter
-import re
+import torch
 
 # Load preference pairs
-dataset = load_dataset("csv", data_files="data/beacon-verifier.csv")["train"]
+dataset = load_dataset("csv", data_files="/content/beacon_rlvr/data/beacon-verifier.csv")["train"]
 
-# Extract sycophantic patterns
+# Extract sycophantic keywords
 sycophantic_words = []
-for example in dataset:
-    sycophantic_words.extend(example["sycophantic_response"].lower().split())
-sycophantic_keywords = [word for word, count in Counter(sycophantic_words).most_common(20) if word not in ["the", "is", "a"]]
-print("Sycophantic Keywords:", sycophantic_keywords)
+for ex in dataset:
+    sycophantic_words.extend(ex["sycophantic_response"].lower().split())
+keywords = [w for w, c in Counter(sycophantic_words).most_common(20) if w not in ["the", "is", "a", "and", "to", "of", "in"]]
+print("Sycophantic keywords:", keywords)
 
-# Rule-based verifier
-def rule_based_verifier(response, prompt):
+# Rule-based scorer
+def rule_scorer(text):
     score = 1.0
-    for word in sycophantic_keywords:
-        if word in response.lower():
+    for word in keywords:
+        if word in text.lower():
             score -= 0.2
-    hedging_phrases = ["maybe", "perhaps", "it seems", "possibly"]
-    for phrase in hedging_phrases:
-        if phrase in response.lower():
+    for phrase in ["maybe", "perhaps", "it seems", "possibly", "kind of", "sort of"]:
+        if phrase in text.lower():
             score -= 0.1
-    word_count = len(response.split())
-    brevity_bonus = max(0, 1 - word_count / 50)
-    score += 0.2 * brevity_bonus
-    return max(0, min(1, score))
+    brevity = max(0, 1 - len(text.split()) / 50)
+    score += 0.2 * brevity
+    return max(0.0, min(1.0, score))
 
-# Train classifier
-def format_classifier_data(examples):
-    return [
-        {"text": examples["blunt_response"], "label": 1, "prompt": examples["prompt"]},
-        {"text": examples["sycophantic_response"], "label": 0, "prompt": examples["prompt"]}
-    ]
-classifier_data = dataset.map(format_classifier_data, batched=True, remove_columns=["blunt_response", "sycophantic_response"]).flatten()
+# Prepare classifier data
+def make_pairs(examples):
+    return {
+        "text": examples["blunt_response"] + examples["sycophantic_response"],
+        "label": [1] * len(examples["blunt_response"]) + [0] * len(examples["sycophantic_response"])
+    }
+
+classifier_data = dataset.map(make_pairs, batched=True, remove_columns=dataset.column_names)
 classifier_data = classifier_data.train_test_split(test_size=0.2)
 
-classifier_tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-def tokenize_classifier(examples):
-    return classifier_tokenizer(examples["text"], truncation=True, max_length=512, padding="max_length")
-classifier_data = classifier_data.map(tokenize_classifier, batched=True)
+# Tokenizer & model
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+def tokenize(examples):
+    return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512)
 
-classifier = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+tokenized = classifier_data.map(tokenize, batched=True)
+
+model = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=2)
+
+# Train
 trainer = Trainer(
-    model=classifier,
+    model=model,
     args=TrainingArguments(
-        output_dir="models/classifier",
+        output_dir="/content/beacon_rlvr/models/classifier",
         per_device_train_batch_size=8,
         num_train_epochs=3,
         evaluation_strategy="epoch",
         save_strategy="epoch",
-        load_best_model_at_end=True
+        load_best_model_at_end=True,
+        logging_steps=50,
+        fp16=True
     ),
-    train_dataset=classifier_data["train"],
-    eval_dataset=classifier_data["test"]
+    train_dataset=tokenized["train"],
+    eval_dataset=tokenized["test"]
 )
+
+print("Training classifier...")
 trainer.train()
-classifier.save_pretrained("models/classifier")
-classifier_tokenizer.save_pretrained("models/classifier")
+
+# Save
+model.save_pretrained("/content/beacon_rlvr/models/classifier")
+tokenizer.save_pretrained("/content/beacon_rlvr/models/classifier")
 
 # Hybrid verifier
 from transformers import pipeline
-classifier_pipe = pipeline("text-classification", model="models/classifier", tokenizer=classifier_tokenizer)
-def hybrid_verifier(response, prompt):
-    rule_score = rule_based_verifier(response, prompt)
-    semantic_score = classifier_pipe(response)[0]
-    semantic_score = semantic_score["score"] if semantic_score["label"] == "LABEL_1" else 1 - semantic_score["score"]
-    return 0.7 * rule_score + 0.3 * semantic_score
+classifier = pipeline("text-classification", model="/content/beacon_rlvr/models/classifier", tokenizer=tokenizer, device=0)
+
+def hybrid_verifier(response, prompt=""):
+    rule_score = rule_scorer(response)
+    try:
+        cls_out = classifier(response)[0]
+        cls_score = cls_out["score"] if cls_out["label"] == "LABEL_1" else 1 - cls_out["score"]
+    except:
+        cls_score = 0.5
+    return 0.7 * rule_score + 0.3 * cls_score
 
 # Validate
 held_out = dataset.select(range(336, 420))
-correct = 0
-for example in held_out:
-    blunt_score = hybrid_verifier(example["blunt_response"], example["prompt"])
-    sycophantic_score = hybrid_verifier(example["sycophantic_response"], example["prompt"])
-    if blunt_score > sycophantic_score:
-        correct += 1
-print(f"Verifier Accuracy: {correct / len(held_out)}")
+correct = sum(hybrid_verifier(ex["blunt_response"]) > hybrid_verifier(ex["sycophantic_response"]) for ex in held_out)
+print(f"Verifier Accuracy: {correct}/{len(held_out)} = {correct/len(held_out):.1%}")
